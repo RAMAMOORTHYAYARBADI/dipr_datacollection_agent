@@ -1,0 +1,86 @@
+name: Daily DIPR Press Release Collection
+
+on:
+  schedule:
+    # 6:00 PM IST = 12:30 PM UTC every day
+    - cron: "30 12 * * *"
+
+  # Allow manual trigger from GitHub Actions tab
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Run mode"
+        required: true
+        default: "validate-only"
+        type: choice
+        options:
+          - validate-only
+          - full
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      # ── 1. Checkout repo ─────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python setup ───────────────────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # ── 3. Install Chrome for Selenium ───────────────────────────────────
+      - name: Install Chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      # ── 4. Install Python dependencies ───────────────────────────────────
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── 5. Restore PDFs cache (avoid re-downloading old PDFs) ────────────
+      - name: Restore PDFs cache
+        uses: actions/cache@v4
+        with:
+          path: pdfs/
+          key: pdfs-${{ runner.os }}-${{ hashFiles('pdfs/manifest.json') }}
+          restore-keys: |
+            pdfs-${{ runner.os }}-
+
+      # ── 6. Run the agent ─────────────────────────────────────────────────
+      - name: Run DIPR agent
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          HF_TOKEN:     ${{ secrets.HF_TOKEN }}
+          HF_REPO_ID:   ${{ secrets.HF_REPO_ID }}
+        run: |
+          MODE="${{ github.event.inputs.mode || 'validate-only' }}"
+          if [ "$MODE" = "full" ]; then
+            python agent.py
+          else
+            python agent.py --validate-only
+          fi
+
+      # ── 7. Save manifest after run ────────────────────────────────────────
+      - name: Commit updated manifest
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add pdfs/manifest.json output/ reports/ || true
+          git diff --staged --quiet || git commit -m "chore: daily update $(date -u '+%Y-%m-%d')"
+          git push
+
+      # ── 8. Upload report as artifact ──────────────────────────────────────
+      - name: Upload audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: audit-report-${{ github.run_number }}
+          path: reports/audit_*.txt
+          retention-days: 30
