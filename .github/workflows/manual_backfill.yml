@@ -1,0 +1,50 @@
+name: Manual Backfill (run once for historical data)
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Type YES to run full historical backfill"
+        required: true
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180    # 3 hours — 245 PDFs takes time
+    if: github.event.inputs.confirm == 'YES'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      - run: pip install -r requirements.txt
+
+      - name: Full backfill run
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          HF_TOKEN:     ${{ secrets.HF_TOKEN }}
+          HF_REPO_ID:   ${{ secrets.HF_REPO_ID }}
+        run: python agent.py
+
+      - name: Commit results
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add pdfs/manifest.json output/ reports/ || true
+          git diff --staged --quiet || git commit -m "chore: historical backfill $(date -u '+%Y-%m-%d')"
+          git push
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: backfill-report
+          path: reports/
+          retention-days: 90
