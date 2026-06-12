@@ -3,7 +3,7 @@ name: Daily DIPR Press Release Collection
 on:
   schedule:
     # 6:00 PM IST = 12:30 PM UTC every day
-    - cron: "30 12 * * *"
+    - cron: "35 20 * * *"
 
   # Allow manual trigger from GitHub Actions tab
   workflow_dispatch:
