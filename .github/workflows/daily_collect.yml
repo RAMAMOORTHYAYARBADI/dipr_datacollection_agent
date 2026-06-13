@@ -16,7 +16,7 @@ on:
           - validate-only
 
 env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true   # fix Node.js 20 deprecation warning
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true   # suppress Node 20 deprecation warning
 
 jobs:
   collect:
@@ -24,23 +24,37 @@ jobs:
     timeout-minutes: 90
 
     steps:
+      # ── 1. Checkout ───────────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # ── 2. Python ─────────────────────────────────────────────────────
       - name: Setup Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Install Chrome (stable)
+      # ── 3. Chrome ─────────────────────────────────────────────────────
+      - name: Install Chrome
         uses: browser-actions/setup-chrome@v1
         with:
           chrome-version: stable
 
-      - name: Install Python dependencies
-        run: pip install -r requirements.txt
+      # ── 4. Show Chrome version (debug) ────────────────────────────────
+      - name: Verify Chrome
+        run: |
+          google-chrome --version || chromium --version || chromium-browser --version
+          which chromedriver || echo "chromedriver not in PATH yet"
 
+      # ── 5. Dependencies ───────────────────────────────────────────────
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          python -c "import selenium, bs4, requests, huggingface_hub; print('All imports OK')"
+
+      # ── 6. Run agent (with detailed error output) ─────────────────────
       - name: Run DIPR agent
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
@@ -48,13 +62,18 @@ jobs:
           HF_REPO_ID:   ${{ secrets.HF_REPO_ID }}
         run: |
           MODE="${{ github.event.inputs.mode || 'full' }}"
+          echo "Running in mode: $MODE"
+          echo "HF_REPO_ID: $HF_REPO_ID"
+          echo "HF_TOKEN set: ${{ secrets.HF_TOKEN != '' }}"
+
           if [ "$MODE" = "validate-only" ]; then
             python agent.py --validate-only
           else
             python agent.py
           fi
 
-      - name: Commit updated manifest and reports
+      # ── 7. Commit manifest + reports ──────────────────────────────────
+      - name: Commit updated files
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -62,10 +81,13 @@ jobs:
           git diff --staged --quiet || git commit -m "chore: daily update $(date -u '+%Y-%m-%d')"
           git push
 
-      - name: Upload audit report as artifact
+      # ── 8. Upload report artifact (even on failure) ───────────────────
+      - name: Upload audit report
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: audit-report-${{ github.run_number }}
-          path: reports/audit_*.txt
+          path: |
+            reports/audit_*.txt
+            agent.log
           retention-days: 30
