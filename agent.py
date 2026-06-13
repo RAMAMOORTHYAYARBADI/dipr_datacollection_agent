@@ -1,34 +1,30 @@
 """
-DIPR TN — Agentic Download + Validate + Auto-Fix Pipeline
-===========================================================
-One script. Runs everything end-to-end:
+DIPR TN — Complete Agentic Pipeline
+=====================================
+Phase 1: Download PDFs from website (skip already done)
+Phase 2: Upload NEW PDFs to HuggingFace → delete from local disk
+Phase 3: Validate (website vs HF vs manifest)
+Phase 4: Auto-fix any issues found
+Phase 5: Rebuild manifest from HF file list
+Phase 6: Final check + report
 
-  Phase 1 — DOWNLOAD   : Scrape each date from website, download all PDFs
-  Phase 2 — VALIDATE   : 12 scenario checks against live website + disk
-  Phase 3 — AUTO-FIX   : Resolve every issue found automatically
-  Phase 4 — REBUILD    : Rebuild manifest from ground truth (disk + website)
-  Phase 5 — FINAL CHECK: Re-run all checks, confirm 0 issues
-  Phase 6 — REPORT     : Save full audit trail
+Zero manual interaction. Runs fully on GitHub Actions cron.
 
-Usage:
-    python agent.py                  # Full run
-    python agent.py --validate-only  # Skip download, validate + fix existing
-    python agent.py --report-only    # Just print report from last run
+HuggingFace layout:
+  pdfs/2026-05-10/DIPR-P.R.No.001-...pdf
+  pdfs/2026-05-11/DIPR-P.R.No.004-...pdf
+  ...
+  manifest.json   ← synced every run
 
-Handles ALL scenarios automatically:
-  - Missing PDFs             → re-download from website
-  - Wrong-date files in folder → move to correct folder + fix manifest
-  - Manifest entry, no file  → re-download
-  - File on disk, not in manifest → add to manifest
-  - Corrupt PDF              → re-download
-  - PR-??? not extracted     → re-extract with extended regex
-  - Bad department           → re-extract with scoring algorithm
-  - Duplicate manifest entries → deduplicate
-  - Path date mismatch       → fix path in manifest
-  - date_no_pdfs wrong       → verify against website and correct
+GitHub repo layout (code only, no PDFs):
+  agent.py
+  requirements.txt
+  .github/workflows/
+  pdfs/manifest.json   ← lightweight tracking file
+  reports/             ← audit reports
 """
 
-import re, json, time, sys, logging, hashlib, shutil, argparse
+import re, json, time, sys, logging, shutil, argparse, os
 from datetime import date, timedelta, datetime
 from pathlib import Path
 from collections import defaultdict
@@ -36,28 +32,30 @@ from collections import defaultdict
 import requests
 from bs4 import BeautifulSoup
 
-# ─────────────────────────────────────────────────────────────
-# CONFIG
-# ─────────────────────────────────────────────────────────────
-START_DATE = date(2026, 5, 10)
-END_DATE   = date.today()
-BASE_URL   = "https://dipr.tn.gov.in/press-release1.html"
+# ── CONFIG ────────────────────────────────────────────────────────────────
+START_DATE  = date(2026, 5, 10)
+END_DATE    = date.today()
 
-PDF_DIR    = Path(__file__).parent / "pdfs"
-MANIFEST   = PDF_DIR / "manifest.json"
-REPORT_DIR = Path(__file__).parent / "reports"
-LOG_FILE   = PDF_DIR / "agent.log"
+BASE_URL    = "https://dipr.tn.gov.in/press-release1.html"
+PDF_DIR     = Path(__file__).parent / "pdfs"
+MANIFEST    = PDF_DIR / "manifest.json"
+REPORT_DIR  = Path(__file__).parent / "reports"
+LOG_FILE    = Path(__file__).parent / "agent.log"
 
-APEX_WAIT    = 20    # seconds to wait for APEX page load
-DELAY_DATE   = 2.0
-DELAY_PDF    = 0.5
-PDF_TIMEOUT  = 40
-MAX_RETRIES  = 3
+# HuggingFace (from env secrets)
+HF_TOKEN    = os.environ.get("HF_TOKEN", "")
+HF_REPO_ID  = os.environ.get("HF_REPO_ID", "")
 
-DOWNLOAD_HEADERS = {
+APEX_WAIT   = 20
+DELAY_DATE  = 2.0
+DELAY_PDF   = 0.5
+PDF_TIMEOUT = 40
+MAX_RETRIES = 3
+
+HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
-    "Referer":    "https://dipr.tn.gov.in/",
-    "Accept":     "application/pdf,*/*",
+    "Referer": "https://dipr.tn.gov.in/",
+    "Accept": "application/pdf,*/*",
 }
 
 PDF_DIR.mkdir(parents=True, exist_ok=True)
@@ -73,9 +71,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("agent")
 
-# ─────────────────────────────────────────────────────────────
-# HELPERS — filename / PR / dept / language
-# ─────────────────────────────────────────────────────────────
+# ── HELPERS ───────────────────────────────────────────────────────────────
 
 def safe_filename(name: str) -> str:
     name = name.replace("%20", " ").replace("+", " ")
@@ -85,14 +81,13 @@ def safe_filename(name: str) -> str:
 
 
 def extract_pr(text: str) -> str:
-    """Extract PR number — covers all DIPR filename patterns."""
     for pat in [
-        r"P\.R\.?\s*N[oO][._\-\s]+(\d+)",   # P.R.No.213 / P.R.No..003 / P.R.NO_-_141
-        r"PR[_\s]N[oO][._\-\s]+(\d+)",       # PR_No.004 / PR_NO.-073
-        r"P\.R\.(\d{3,})",                    # P.R.087 / P.R.179 (no 'No')
-        r"\bPR[-_](\d+)\b",                   # PR-073 standalone
-        r"(?:TNLA|SDAT|TNPSC|DIR|DIPR)[-_]\s*(\d+)\b",  # TNLA-001
-        r"\bNo[._\-]\s*(\d+)",                # No.-073 bare
+        r"P\.R\.?\s*N[oO][._\-\s]+(\d+)",
+        r"PR[_\s]N[oO][._\-\s]+(\d+)",
+        r"P\.R\.(\d{3,})",
+        r"\bPR[-_](\d+)\b",
+        r"(?:TNLA|SDAT|TNPSC|DIR|DIPR)[-_]\s*(\d+)\b",
+        r"\bNo[._\-]\s*(\d+)",
     ]:
         m = re.search(pat, text, re.I)
         if m:
@@ -101,7 +96,6 @@ def extract_pr(text: str) -> str:
 
 
 def extract_dept(text: str) -> str:
-    """Extract department using scoring — picks most specific segment."""
     clean = text.replace("_", " ")
     clean = re.sub(r"(?:DIPR|DIR|TNLA|SDAT|TNPSC)\s*[-–]\s*P\.?R\.?\s*N[oO]\.?[-.]?\s*\d+", "", clean, flags=re.I)
     clean = re.sub(r"^(?:DIPR|DIR|TNLA|SDAT|TNPSC)\s*[-–]?\s*", "", clean, flags=re.I)
@@ -116,19 +110,16 @@ def extract_dept(text: str) -> str:
     def score(p):
         pl = p.lower()
         if re.match(r"hon.?ble\s+cm\s+press\s+release$", pl): return 0
-        if re.match(r"hon.?ble\s+(cm|chief\s+minister)\s*$", pl): return 0
         if pl in {"press release", "press note"}: return 0
         s = 1 + (1 if len(p) > 20 else 0)
         if any(k in pl for k in ["dept","department","minister","meeting","speech",
-            "assembly","institute","centre","council","board","corporation",
-            "authority","aayog","niti","policy","scheme","project","launch",
-            "inaugur","review","coach"]):
+            "assembly","institute","centre","review","scheme","launch","inaugur"]):
             s += 3
         return s
-    best = max(parts, key=score)
-    last = [p for p in parts if score(p) == score(best)][-1]
-    last = re.sub(r"\s*[-–]?\s*Press\s*Release\s*$", "", last, flags=re.I).strip()
-    return last[:100] or "Government of Tamil Nadu"
+    best_score = max(score(p) for p in parts)
+    last = [p for p in parts if score(p) == best_score][-1]
+    return re.sub(r"\s*[-–]?\s*Press\s*Release\s*$", "", last, flags=re.I).strip()[:100] \
+           or "Government of Tamil Nadu"
 
 
 def detect_lang(text: str) -> str:
@@ -138,29 +129,83 @@ def detect_lang(text: str) -> str:
     if len(re.findall(r"[\u0B80-\u0BFF]", text)) > 3: return "Tamil"
     return "English"
 
-
-def make_id(pr: str, dt: str, lang: str) -> str:
-    return hashlib.md5(f"{pr}_{dt}_{lang}".encode()).hexdigest()[:12]
-
-# ─────────────────────────────────────────────────────────────
-# MANIFEST
-# ─────────────────────────────────────────────────────────────
+# ── MANIFEST ──────────────────────────────────────────────────────────────
 
 def load_manifest() -> dict:
     if MANIFEST.exists():
         with open(MANIFEST, encoding="utf-8") as f:
             return json.load(f)
-    return {"dates_done": [], "dates_no_pdfs": [], "downloaded": [], "failed": []}
+    return {
+        "collection_start": START_DATE.isoformat(),
+        "dates_done": [], "dates_no_pdfs": [],
+        "downloaded": [], "failed": [],
+        "run_history": [],
+    }
 
 
 def save_manifest(m: dict):
-    m["last_saved"] = datetime.now().isoformat(timespec="seconds")
+    m["last_updated"]      = datetime.now().isoformat(timespec="seconds")
+    m["last_date_scraped"] = END_DATE.isoformat()
+    m["total_records"]     = len(m.get("downloaded", []))
     with open(MANIFEST, "w", encoding="utf-8") as f:
         json.dump(m, f, ensure_ascii=False, indent=2)
 
-# ─────────────────────────────────────────────────────────────
-# SELENIUM — shared driver
-# ─────────────────────────────────────────────────────────────
+# ── HUGGINGFACE ───────────────────────────────────────────────────────────
+
+def hf_list_pdfs() -> set:
+    """Return set of all PDF paths already on HuggingFace (e.g. 'pdfs/2026-05-10/file.pdf')"""
+    if not HF_TOKEN or not HF_REPO_ID:
+        log.warning("HF_TOKEN or HF_REPO_ID not set — skipping HF operations")
+        return set()
+    try:
+        from huggingface_hub import HfApi
+        api   = HfApi(token=HF_TOKEN)
+        files = api.list_repo_files(repo_id=HF_REPO_ID, repo_type="dataset")
+        return {f for f in files if f.lower().endswith(".pdf")}
+    except Exception as e:
+        log.error(f"HF list error: {e}")
+        return set()
+
+
+def hf_upload_file(local_path: Path, hf_path: str) -> bool:
+    """Upload one file to HuggingFace dataset repo."""
+    if not HF_TOKEN or not HF_REPO_ID:
+        return False
+    try:
+        from huggingface_hub import HfApi
+        api = HfApi(token=HF_TOKEN)
+        api.upload_file(
+            path_or_fileobj=str(local_path),
+            path_in_repo=hf_path,
+            repo_id=HF_REPO_ID,
+            repo_type="dataset",
+        )
+        return True
+    except Exception as e:
+        log.error(f"HF upload error {hf_path}: {e}")
+        return False
+
+
+def hf_upload_manifest() -> bool:
+    """Upload manifest.json to HuggingFace."""
+    if not HF_TOKEN or not HF_REPO_ID:
+        return False
+    try:
+        from huggingface_hub import HfApi
+        api = HfApi(token=HF_TOKEN)
+        api.upload_file(
+            path_or_fileobj=str(MANIFEST),
+            path_in_repo="manifest.json",
+            repo_id=HF_REPO_ID,
+            repo_type="dataset",
+        )
+        log.info("  Manifest synced to HuggingFace")
+        return True
+    except Exception as e:
+        log.error(f"HF manifest upload error: {e}")
+        return False
+
+# ── SELENIUM ──────────────────────────────────────────────────────────────
 
 def make_driver():
     from selenium import webdriver
@@ -176,32 +221,25 @@ def make_driver():
     opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+                      "AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36")
     svc = Service(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=svc, options=opts)
     driver.implicitly_wait(5)
     return driver
 
 
-def scrape_date(driver, target: date) -> list[dict]:
-    """
-    Scrape the DIPR website for a specific date.
-    Returns list of PDF metadata dicts with verified date.
-    """
+def scrape_date(driver, target: date) -> list:
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
 
     date_val = target.strftime("%Y-%m-%d")
-    date_disp = target.strftime("%d/%m/%Y")
-
     wait = WebDriverWait(driver, 15)
     if "press-release1" not in driver.current_url:
         driver.get(BASE_URL)
         wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
         time.sleep(2)
 
-    # Find date input by confirmed id
     date_input = None
     try:
         date_input = driver.find_element(By.ID, "press_release_date")
@@ -210,165 +248,122 @@ def scrape_date(driver, target: date) -> list[dict]:
             try:
                 el = driver.find_element(By.CSS_SELECTOR, sel)
                 if el.is_displayed():
-                    date_input = el
-                    break
+                    date_input = el; break
             except Exception:
                 pass
 
     if not date_input:
-        log.warning(f"  Date input not found for {date_disp}")
+        log.warning(f"  Date input not found for {target}")
         return []
 
-    # Set date via native property setter + fire events
     driver.execute_script("""
-        var el = arguments[0], val = arguments[1];
+        var el=arguments[0], val=arguments[1];
         Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value')
-              .set.call(el, val);
-        el.dispatchEvent(new Event('input',  {bubbles:true}));
-        el.dispatchEvent(new Event('change', {bubbles:true}));
+              .set.call(el,val);
+        el.dispatchEvent(new Event('input',{bubbles:true}));
+        el.dispatchEvent(new Event('change',{bubbles:true}));
         el.blur();
     """, date_input, date_val)
 
     time.sleep(0.5)
-
-    # Submit if button present
-    for xpath in ["//button[@type='submit']", "//input[@type='submit']"]:
+    for xpath in ["//button[@type='submit']","//input[@type='submit']"]:
         try:
             btn = driver.find_element(By.XPATH, xpath)
             if btn.is_displayed():
-                btn.click()
-                break
+                btn.click(); break
         except Exception:
             pass
 
-    # Wait for PDF links — up to APEX_WAIT seconds
     for sec in range(APEX_WAIT):
         time.sleep(1)
         links = driver.find_elements(
-            By.XPATH, "//a[contains(translate(@href,'PDF','pdf'),'.pdf')]")
+            By.XPATH,"//a[contains(translate(@href,'PDF','pdf'),'.pdf')]")
         if links:
-            log.info(f"    PDF links appeared after {sec+1}s")
+            log.info(f"  Links appeared after {sec+1}s")
             break
 
-    # Verify page shows correct date
-    page_src = driver.page_source
-    date_in_page = any(p in page_src for p in [
-        target.strftime("%d/%m/%Y"),
-        target.strftime("%d.%m.%Y"),
-        f"{target.day}/{target.month}/{target.year}",
-    ])
-    if not date_in_page:
-        log.warning(f"    Page may not have updated to {date_disp} — verifying...")
-        # Try setting date again
-        try:
-            driver.execute_script("""
-                var el = arguments[0], val = arguments[1];
-                Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value')
-                      .set.call(el, val);
-                el.dispatchEvent(new Event('input',  {bubbles:true}));
-                el.dispatchEvent(new Event('change', {bubbles:true}));
-            """, date_input, date_val)
-            time.sleep(3)
-            page_src = driver.page_source
-        except Exception:
-            pass
-
-    return parse_pdf_links(page_src, target)
+    return parse_links(driver.page_source, target)
 
 
-def parse_pdf_links(html: str, target: date) -> list[dict]:
-    """Parse all PDF links from page HTML."""
+def parse_links(html: str, target: date) -> list:
     soup = BeautifulSoup(html, "html.parser")
-    results = []
-    seen = set()
+    results, seen = [], set()
     for a in soup.find_all("a", href=True):
-        href = a.get("href", "").strip()
+        href = a.get("href","").strip()
         text = a.get_text(" ", strip=True)
-        if not (".pdf" in href.lower() or ".PDF" in href):
+        if ".pdf" not in href.lower() and ".PDF" not in href:
             continue
-        if len(text) < 5 and not href.lower().endswith(".pdf"):
-            continue
-        full_url = (href if href.startswith("http") else
-                    "https://dipr.tn.gov.in" + href if href.startswith("/") else
-                    "https://dipr.tn.gov.in/" + href)
-        raw = href.split("/")[-1].split("?")[0]
-        fname = safe_filename(raw or text)
-        if not fname.lower().endswith(".pdf"):
-            fname += ".pdf"
-        if fname.lower() in seen:
-            continue
-        seen.add(fname.lower())
-        combined = (text + " " + fname) if len(text) > 10 else fname
+        full = (href if href.startswith("http") else
+                "https://dipr.tn.gov.in" + href if href.startswith("/") else
+                "https://dipr.tn.gov.in/" + href)
+        raw  = href.split("/")[-1].split("?")[0]
+        fn   = safe_filename(raw or text)
+        if not fn.lower().endswith(".pdf"): fn += ".pdf"
+        if fn.lower() in seen: continue
+        seen.add(fn.lower())
+        combined = (text + " " + fn) if len(text) > 10 else fn
         results.append({
             "date":         target.isoformat(),
             "date_display": target.strftime("%d/%m/%Y"),
-            "filename":     fname,
+            "filename":     fn,
             "title":        text,
-            "url":          full_url,
+            "url":          full,
             "pr_number":    extract_pr(combined),
             "language":     detect_lang(combined),
-            "department":   extract_dept(text if len(text) > 10 else fname),
+            "department":   extract_dept(text if len(text)>10 else fn),
         })
     return results
 
-# ─────────────────────────────────────────────────────────────
-# DOWNLOAD
-# ─────────────────────────────────────────────────────────────
+# ── DOWNLOAD ONE PDF ──────────────────────────────────────────────────────
 
 def download_pdf(entry: dict, dest_dir: Path) -> dict:
-    """Download one PDF. Returns updated entry."""
     dest = dest_dir / entry["filename"]
-    rel  = str(Path("pdfs") / entry["date"] / entry["filename"])
+    rel  = f"pdfs/{entry['date']}/{entry['filename']}"
 
     if dest.exists() and dest.stat().st_size > 1000:
         try:
-            with open(dest, "rb") as f:
+            with open(dest,"rb") as f:
                 if f.read(4) == b"%PDF":
-                    log.info(f"    ⏭️  Exists: {entry['filename'][:60]}")
-                    return {**entry, "local_path": rel,
-                            "download_status": "exists",
-                            "file_size_kb": round(dest.stat().st_size/1024,1)}
+                    log.info(f"  ⏭  Exists: {entry['filename'][:60]}")
+                    return {**entry,"local_path":rel,"download_status":"exists",
+                            "file_size_kb":round(dest.stat().st_size/1024,1)}
         except Exception:
             pass
 
     last_err = ""
-    for attempt in range(1, MAX_RETRIES + 1):
+    for attempt in range(1, MAX_RETRIES+1):
         try:
-            r = requests.get(entry["url"], headers=DOWNLOAD_HEADERS,
+            r = requests.get(entry["url"], headers=HEADERS,
                              timeout=PDF_TIMEOUT, stream=True)
             r.raise_for_status()
             content = b"".join(r.iter_content(65536))
             if len(content) < 1000:
                 raise ValueError(f"Too small ({len(content)} bytes)")
             if content[:4] != b"%PDF":
-                raise ValueError(f"Not a PDF (magic: {content[:8]})")
+                raise ValueError(f"Not a PDF")
             dest.write_bytes(content)
             kb = len(content)/1024
-            log.info(f"    ✅ {entry['filename'][:60]:60s}  {kb:.1f} KB")
-            return {**entry, "local_path": rel,
-                    "download_status": "ok",
-                    "file_size_kb": round(kb, 1)}
+            log.info(f"  ✅ {entry['filename'][:60]:60s}  {kb:.1f} KB")
+            return {**entry,"local_path":rel,"download_status":"ok",
+                    "file_size_kb":round(kb,1)}
         except Exception as e:
             last_err = str(e)
             if attempt < MAX_RETRIES:
-                log.warning(f"    ⚠️  Attempt {attempt}/{MAX_RETRIES}: {e}")
-                time.sleep(2 ** attempt)
+                time.sleep(2**attempt)
 
-    log.error(f"    ❌ FAILED: {entry['filename'][:60]}")
-    return {**entry, "local_path": "", "download_status": "failed", "error": last_err}
+    log.error(f"  ❌ FAILED: {entry['filename'][:60]}")
+    return {**entry,"local_path":"","download_status":"failed","error":last_err}
 
-# ─────────────────────────────────────────────────────────────
-# PHASE 1 — DOWNLOAD (skip already-done dates)
-# ─────────────────────────────────────────────────────────────
+# ── PHASE 1: DOWNLOAD ─────────────────────────────────────────────────────
 
 def phase_download(driver, manifest: dict) -> dict:
     log.info("\n" + "═"*60)
     log.info("PHASE 1 — DOWNLOAD")
     log.info("═"*60)
 
-    dates_done  = set(manifest.get("dates_done", []))
-    downloaded  = list(manifest.get("downloaded", []))
-    failed      = list(manifest.get("failed", []))
+    dates_done  = set(manifest.get("dates_done",[]))
+    downloaded  = list(manifest.get("downloaded",[]))
+    failed      = list(manifest.get("failed",[]))
 
     all_dates = []
     d = START_DATE
@@ -377,26 +372,26 @@ def phase_download(driver, manifest: dict) -> dict:
         d += timedelta(days=1)
 
     pending = [d for d in all_dates if d.isoformat() not in dates_done]
-    log.info(f"  Total dates: {len(all_dates)}  |  Already done: {len(dates_done)}  |  Pending: {len(pending)}")
+    log.info(f"  Total: {len(all_dates)}  Done: {len(dates_done)}  Pending: {len(pending)}")
 
-    ok = sum(1 for e in downloaded if e.get("download_status") == "ok")
-    skip = sum(1 for e in downloaded if e.get("download_status") == "exists")
+    new_pdfs = 0
 
     for i, target in enumerate(pending, 1):
         ds = target.isoformat()
-        log.info(f"\n  [{i:>3}/{len(pending)}]  {target.strftime('%A, %d %b %Y')}")
+        log.info(f"\n  [{i}/{len(pending)}] {target.strftime('%A, %d %b %Y')}")
+
         try:
             entries = scrape_date(driver, target)
         except Exception as e:
-            log.error(f"    Scrape error: {e}")
+            log.error(f"  Scrape error: {e}")
             entries = []
 
         if not entries:
-            log.info(f"    No PDFs found for {ds}")
             dates_done.add(ds)
+            no_pdfs = set(manifest.get("dates_no_pdfs",[]))
+            no_pdfs.add(ds)
+            manifest["dates_no_pdfs"] = sorted(no_pdfs)
             manifest["dates_done"]    = sorted(dates_done)
-            manifest["dates_no_pdfs"] = sorted(
-                set(manifest.get("dates_no_pdfs", [])) | {ds})
             save_manifest(manifest)
             time.sleep(DELAY_DATE)
             continue
@@ -408,14 +403,12 @@ def phase_download(driver, manifest: dict) -> dict:
         for entry in entries:
             result = download_pdf(entry, date_dir)
             time.sleep(DELAY_PDF)
-            if result["download_status"] in ("ok", "exists"):
+            if result["download_status"] in ("ok","exists"):
                 if result["filename"] not in existing:
                     downloaded.append(result)
                     existing.add(result["filename"])
                 if result["download_status"] == "ok":
-                    ok += 1
-                else:
-                    skip += 1
+                    new_pdfs += 1
             else:
                 failed.append(result)
 
@@ -424,410 +417,289 @@ def phase_download(driver, manifest: dict) -> dict:
         manifest["downloaded"] = downloaded
         manifest["failed"]     = failed
         save_manifest(manifest)
-        log.info(f"    📊 ✅{ok} downloaded  ⏭️{skip} skipped  ❌{len(failed)} failed")
         time.sleep(DELAY_DATE)
 
+    log.info(f"\n  Download complete. New PDFs this run: {new_pdfs}")
+    manifest["_new_pdfs_this_run"] = new_pdfs
     return manifest
 
-# ─────────────────────────────────────────────────────────────
-# PHASE 2 — VALIDATE: Compare website vs disk per date
-# ─────────────────────────────────────────────────────────────
+# ── PHASE 2: UPLOAD TO HUGGINGFACE → DELETE LOCAL ─────────────────────────
 
-def phase_validate(driver, manifest: dict) -> tuple[dict, list]:
-    """
-    For every date: scrape website → compare with manifest + disk.
-    Returns (manifest, issues_list).
-    Each issue: {type, date, details, auto_fixable, ...}
-    """
+def phase_upload_to_hf(manifest: dict) -> dict:
     log.info("\n" + "═"*60)
-    log.info("PHASE 2 — VALIDATE (website vs disk vs manifest)")
+    log.info("PHASE 2 — UPLOAD TO HUGGINGFACE + CLEAN LOCAL")
     log.info("═"*60)
 
-    downloaded  = manifest.get("downloaded", [])
-    dates_no_pdfs = set(manifest.get("dates_no_pdfs", []))
+    if not HF_TOKEN or not HF_REPO_ID:
+        log.warning("  HF_TOKEN/HF_REPO_ID not set — skipping upload")
+        return manifest
 
-    # Index manifest by date
-    manifest_by_date = defaultdict(list)
-    for e in downloaded:
-        manifest_by_date[e["date"]].append(e)
+    # Get what's already on HF
+    log.info("  Fetching existing HuggingFace file list...")
+    hf_files = hf_list_pdfs()
+    log.info(f"  Already on HuggingFace: {len(hf_files)} PDFs")
 
-    all_dates = []
+    uploaded  = 0
+    deleted   = 0
+    failed_up = 0
+
+    # Walk every date folder on disk
     d = START_DATE
-    while d <= END_DATE:
-        all_dates.append(d)
+    while d <= date.today():
+        ds       = d.isoformat()
+        date_dir = PDF_DIR / ds
         d += timedelta(days=1)
 
-    issues = []
-    total_web = 0
-    total_disk = 0
+        if not date_dir.exists():
+            continue
 
-    for target in all_dates:
-        ds = target.isoformat()
-        log.info(f"\n  Checking {ds} ({target.strftime('%A')})")
+        pdfs = list(date_dir.glob("*.pdf")) + list(date_dir.glob("*.PDF"))
+        if not pdfs:
+            # remove empty folder
+            try: date_dir.rmdir()
+            except Exception: pass
+            continue
 
-        # Scrape website
-        try:
-            web_entries = scrape_date(driver, target)
-            time.sleep(DELAY_DATE)
-        except Exception as e:
-            log.error(f"    Scrape error: {e}")
-            web_entries = []
+        for pdf in pdfs:
+            hf_path = f"pdfs/{ds}/{pdf.name}"
 
-        web_filenames = {e["filename"].lower(): e for e in web_entries}
-        total_web += len(web_entries)
-
-        # Manifest entries for this date
-        mfst_entries = manifest_by_date.get(ds, [])
-        mfst_filenames = {e["filename"].lower(): e for e in mfst_entries}
-
-        # Actual disk files for this date
-        date_dir = PDF_DIR / ds
-        disk_files = {}
-        if date_dir.exists():
-            for f in date_dir.iterdir():
-                if f.suffix.lower() == ".pdf":
-                    disk_files[f.name.lower()] = f
-        total_disk += len(disk_files)
-
-        log.info(f"    Website:{len(web_entries)}  Manifest:{len(mfst_entries)}  Disk:{len(disk_files)}")
-
-        # ── Check 1: Website PDF missing from disk ─────────────────
-        for fname_lower, web_entry in web_filenames.items():
-            if fname_lower not in disk_files:
-                issues.append({
-                    "type": "MISSING_FROM_DISK",
-                    "date": ds, "filename": web_entry["filename"],
-                    "url":  web_entry["url"],
-                    "entry": web_entry,
-                    "auto_fixable": True,
-                    "fix": "download",
-                })
-                log.warning(f"    ❌ MISSING_FROM_DISK: {web_entry['filename'][:55]}")
-
-        # ── Check 2: Disk file not on website (wrong date) ─────────
-        for fname_lower, disk_path in disk_files.items():
-            if fname_lower not in web_filenames:
-                # Check if this file belongs to a different date
-                issues.append({
-                    "type": "WRONG_DATE_IN_FOLDER",
-                    "date": ds,
-                    "filename": disk_path.name,
-                    "disk_path": str(disk_path),
-                    "auto_fixable": True,
-                    "fix": "move_or_delete",
-                })
-                log.warning(f"    ❌ WRONG_DATE_IN_FOLDER: {disk_path.name[:55]}")
-
-        # ── Check 3: Manifest entry but file missing from disk ─────
-        for fname_lower, mfst_entry in mfst_filenames.items():
-            if fname_lower not in disk_files:
-                issues.append({
-                    "type": "MANIFEST_FILE_MISSING",
-                    "date": ds, "filename": mfst_entry["filename"],
-                    "url":  mfst_entry.get("url", ""),
-                    "entry": mfst_entry,
-                    "auto_fixable": True,
-                    "fix": "download",
-                })
-                log.warning(f"    ❌ MANIFEST_FILE_MISSING: {mfst_entry['filename'][:55]}")
-
-        # ── Check 4: Corrupt PDF ────────────────────────────────────
-        for fname_lower, disk_path in disk_files.items():
-            size = disk_path.stat().st_size
-            if size < 1000:
-                issues.append({
-                    "type": "CORRUPT_SMALL",
-                    "date": ds, "filename": disk_path.name,
-                    "disk_path": str(disk_path), "size": size,
-                    "auto_fixable": True, "fix": "redownload",
-                    "url": web_filenames.get(fname_lower, {}).get("url", ""),
-                })
-                log.warning(f"    ❌ CORRUPT_SMALL: {disk_path.name[:55]} ({size}B)")
-                continue
-            try:
-                with open(disk_path, "rb") as f:
-                    magic = f.read(4)
-                if magic != b"%PDF":
-                    issues.append({
-                        "type": "CORRUPT_MAGIC",
-                        "date": ds, "filename": disk_path.name,
-                        "disk_path": str(disk_path),
-                        "auto_fixable": True, "fix": "redownload",
-                        "url": web_filenames.get(fname_lower, {}).get("url", ""),
-                    })
-                    log.warning(f"    ❌ CORRUPT_MAGIC: {disk_path.name[:55]}")
-            except Exception:
-                pass
-
-        # ── Check 5: PR-??? in manifest ────────────────────────────
-        for e in mfst_entries:
-            if e.get("pr_number") == "PR-???":
-                new_pr = extract_pr(e.get("title","") + " " + e.get("filename",""))
-                issues.append({
-                    "type": "BAD_PR_NUMBER",
-                    "date": ds, "filename": e["filename"],
-                    "current": "PR-???", "suggested": new_pr,
-                    "auto_fixable": True, "fix": "update_manifest",
-                    "manifest_entry": e,
-                })
-
-        # ── Check 6: Duplicate manifest entries ────────────────────
-        seen_fn = {}
-        for e in mfst_entries:
-            fn = e["filename"].lower()
-            if fn in seen_fn:
-                issues.append({
-                    "type": "DUPLICATE_MANIFEST",
-                    "date": ds, "filename": e["filename"],
-                    "auto_fixable": True, "fix": "deduplicate",
-                })
+            if hf_path in hf_files:
+                # Already on HF — just delete local copy
+                pdf.unlink()
+                deleted += 1
+                log.info(f"  🗑  Already on HF, deleted local: {pdf.name[:55]}")
             else:
-                seen_fn[fn] = e
+                # New file — upload then delete
+                log.info(f"  ⬆  Uploading: {pdf.name[:55]}")
+                ok = hf_upload_file(pdf, hf_path)
+                if ok:
+                    pdf.unlink()
+                    uploaded += 1
+                    log.info(f"  ✅ Uploaded + deleted: {pdf.name[:55]}")
+                else:
+                    failed_up += 1
+                    log.error(f"  ❌ Upload failed, keeping local: {pdf.name[:55]}")
 
-    log.info(f"\n  Validation complete: {len(issues)} issues found")
-    log.info(f"  Website total: {total_web}  |  Disk total: {total_disk}")
+        # Remove folder if now empty
+        try:
+            if date_dir.exists() and not any(date_dir.iterdir()):
+                date_dir.rmdir()
+        except Exception:
+            pass
+
+    # Upload manifest.json to HF as well
+    hf_upload_manifest()
+
+    log.info(f"\n  Upload complete: {uploaded} uploaded, {deleted} already-there deleted, {failed_up} failed")
+
+    manifest["_hf_uploaded"]  = uploaded
+    manifest["_hf_deleted"]   = deleted
+    manifest["_hf_failed"]    = failed_up
+    return manifest
+
+# ── PHASE 3: VALIDATE ─────────────────────────────────────────────────────
+
+def phase_validate(manifest: dict) -> tuple:
+    log.info("\n" + "═"*60)
+    log.info("PHASE 3 — VALIDATE (manifest vs HuggingFace)")
+    log.info("═"*60)
+
+    downloaded    = manifest.get("downloaded", [])
+    dates_done    = set(manifest.get("dates_done", []))
+    dates_no_pdfs = set(manifest.get("dates_no_pdfs", []))
+
+    # Get HF file list once
+    hf_files = hf_list_pdfs()
+    log.info(f"  HuggingFace PDFs: {len(hf_files)}")
+    log.info(f"  Manifest entries: {len(downloaded)}")
+
+    issues = []
+
+    # Check every manifest entry exists on HF
+    for e in downloaded:
+        hf_path = f"pdfs/{e['date']}/{e['filename']}"
+        if hf_path not in hf_files:
+            issues.append({
+                "type": "MISSING_FROM_HF",
+                "date": e["date"],
+                "filename": e["filename"],
+                "url": e.get("url",""),
+                "entry": e,
+            })
+            log.warning(f"  ❌ MISSING_FROM_HF: {e['date']} {e['filename'][:50]}")
+
+    # Check PR-???
+    for e in downloaded:
+        if e.get("pr_number") == "PR-???":
+            new_pr = extract_pr(e.get("title","") + " " + e.get("filename",""))
+            issues.append({
+                "type": "BAD_PR",
+                "entry": e,
+                "suggested": new_pr,
+            })
+
+    # Missing dates
+    all_dates = []
+    dd = START_DATE
+    while dd <= END_DATE:
+        all_dates.append(dd)
+        dd += timedelta(days=1)
+
+    for dd in all_dates:
+        ds = dd.isoformat()
+        if ds not in dates_done and dd < date.today():
+            issues.append({"type": "MISSING_DATE", "date": ds})
+            log.warning(f"  ❌ MISSING_DATE: {ds}")
+
+    log.info(f"\n  Validation: {len(issues)} issues found")
     return manifest, issues
 
-# ─────────────────────────────────────────────────────────────
-# PHASE 3 — AUTO-FIX all issues
-# ─────────────────────────────────────────────────────────────
+# ── PHASE 4: AUTO-FIX ─────────────────────────────────────────────────────
 
-def phase_autofix(driver, manifest: dict, issues: list) -> dict:
+def phase_autofix(manifest: dict, issues: list) -> dict:
     log.info("\n" + "═"*60)
-    log.info(f"PHASE 3 — AUTO-FIX ({len(issues)} issues)")
+    log.info(f"PHASE 4 — AUTO-FIX ({len(issues)} issues)")
     log.info("═"*60)
 
     downloaded = manifest.get("downloaded", [])
-    manifest_by_date_file = {
-        (e["date"], e["filename"].lower()): e
-        for e in downloaded
-    }
-
     fixed = 0
-    failed_fixes = []
 
     for issue in issues:
         itype = issue["type"]
-        ds    = issue["date"]
-        fname = issue.get("filename", "")
-        log.info(f"\n  FIX [{itype}] {ds} — {fname[:55]}")
 
-        # ── FIX: Download missing file ──────────────────────────────
-        if itype in ("MISSING_FROM_DISK", "MANIFEST_FILE_MISSING",
-                     "CORRUPT_SMALL", "CORRUPT_MAGIC"):
-            url = issue.get("url", "")
-            if not url:
-                log.warning("    No URL available — skip")
-                failed_fixes.append(issue)
-                continue
-
+        if itype == "MISSING_FROM_HF":
+            # Re-download and re-upload
+            entry    = issue["entry"]
+            url      = issue.get("url","")
+            ds       = issue["date"]
             date_dir = PDF_DIR / ds
             date_dir.mkdir(exist_ok=True)
-            entry = issue.get("entry", {
-                "date": ds,
-                "date_display": datetime.strptime(ds, "%Y-%m-%d").strftime("%d/%m/%Y"),
-                "filename": fname, "title": fname, "url": url,
-                "pr_number": extract_pr(fname),
-                "language":  detect_lang(fname),
-                "department": extract_dept(fname),
-            })
-            result = download_pdf(entry, date_dir)
-            time.sleep(DELAY_PDF)
 
-            if result["download_status"] in ("ok", "exists"):
-                # Update or add manifest entry
-                key = (ds, fname.lower())
-                if key in manifest_by_date_file:
-                    manifest_by_date_file[key].update(result)
+            if url:
+                result = download_pdf(entry, date_dir)
+                if result["download_status"] in ("ok","exists"):
+                    hf_path = f"pdfs/{ds}/{entry['filename']}"
+                    pdf_path = date_dir / entry["filename"]
+                    if hf_upload_file(pdf_path, hf_path):
+                        pdf_path.unlink(missing_ok=True)
+                        try: date_dir.rmdir()
+                        except Exception: pass
+                        log.info(f"  Fixed: re-downloaded + uploaded {entry['filename'][:50]}")
+                        fixed += 1
+                    else:
+                        log.error(f"  Fix failed (HF upload): {entry['filename'][:50]}")
                 else:
-                    downloaded.append(result)
-                    manifest_by_date_file[key] = result
-                fixed += 1
+                    log.error(f"  Fix failed (download): {entry['filename'][:50]}")
             else:
-                failed_fixes.append(issue)
+                log.warning(f"  No URL for {entry['filename'][:50]} — cannot fix")
 
-        # ── FIX: Wrong-date file in folder ─────────────────────────
-        elif itype == "WRONG_DATE_IN_FOLDER":
-            disk_path = Path(issue.get("disk_path", ""))
-            if not disk_path.exists():
-                continue
-
-            # Find which date this file actually belongs to by matching
-            # it against all web scrapes — look for it in nearby dates
-            moved = False
-            target = datetime.strptime(ds, "%Y-%m-%d").date()
-            for delta in range(-7, 8):  # search ±7 days
-                check_date = target + timedelta(days=delta)
-                if check_date.isoformat() == ds:
-                    continue
-                correct_dir = PDF_DIR / check_date.isoformat()
-                if correct_dir.exists() and (correct_dir / disk_path.name).exists():
-                    # File belongs there already — just delete from wrong folder
-                    log.info(f"    Deleting misplaced copy from {ds}")
-                    disk_path.unlink()
-                    # Remove from manifest if wrongly recorded
-                    downloaded[:] = [
-                        e for e in downloaded
-                        if not (e["date"] == ds and
-                                e["filename"].lower() == disk_path.name.lower())
-                    ]
-                    moved = True
-                    fixed += 1
-                    break
-
-            if not moved:
-                # File exists nowhere else — check if PR number hints at date
-                pr_in_name = extract_pr(disk_path.name)
-                log.info(f"    Orphan file with {pr_in_name} — keeping in place")
-                # Add to manifest with correct date annotation
-                key = (ds, disk_path.name.lower())
-                if key not in manifest_by_date_file:
-                    new_entry = {
-                        "date":         ds,
-                        "date_display": datetime.strptime(ds,"%Y-%m-%d").strftime("%d/%m/%Y"),
-                        "filename":     disk_path.name,
-                        "title":        disk_path.name,
-                        "url":          "",
-                        "pr_number":    pr_in_name,
-                        "language":     detect_lang(disk_path.name),
-                        "department":   extract_dept(disk_path.name),
-                        "local_path":   str(Path("pdfs") / ds / disk_path.name),
-                        "download_status": "exists",
-                        "file_size_kb": round(disk_path.stat().st_size/1024, 1),
-                        "note": "found_on_disk_unknown_date",
-                    }
-                    downloaded.append(new_entry)
-                    manifest_by_date_file[key] = new_entry
+        elif itype == "BAD_PR":
+            entry = issue["entry"]
+            suggested = issue.get("suggested","PR-???")
+            if suggested != "PR-???":
+                for e in downloaded:
+                    if e["filename"] == entry["filename"] and e["date"] == entry["date"]:
+                        e["pr_number"] = suggested
+                        break
+                log.info(f"  Fixed PR: {entry['filename'][:50]} → {suggested}")
                 fixed += 1
 
-        # ── FIX: Bad PR number ──────────────────────────────────────
-        elif itype == "BAD_PR_NUMBER":
-            entry = issue.get("manifest_entry")
-            if entry and issue.get("suggested") != "PR-???":
-                entry["pr_number"] = issue["suggested"]
-                log.info(f"    Fixed PR: {issue['current']} → {issue['suggested']}")
-                fixed += 1
-
-        # ── FIX: Duplicate manifest entries ────────────────────────
-        elif itype == "DUPLICATE_MANIFEST":
-            seen = {}
-            deduped = []
-            for e in downloaded:
-                key = (e["date"], e["filename"].lower())
-                if key not in seen:
-                    seen[key] = True
-                    deduped.append(e)
-            removed = len(downloaded) - len(deduped)
-            downloaded[:] = deduped
-            log.info(f"    Removed {removed} duplicate(s)")
-            fixed += removed if removed else 1
+        elif itype == "MISSING_DATE":
+            log.info(f"  MISSING_DATE {issue['date']} — will be picked up on next cron run")
 
     manifest["downloaded"] = downloaded
-    manifest["failed"]     = [e for e in manifest.get("failed",[])
-                               if e not in failed_fixes]
     save_manifest(manifest)
-
     log.info(f"\n  Auto-fix complete: {fixed}/{len(issues)} fixed")
-    if failed_fixes:
-        log.warning(f"  Could not fix {len(failed_fixes)} issues (no URL or unreachable)")
     return manifest
 
-# ─────────────────────────────────────────────────────────────
-# PHASE 4 — REBUILD MANIFEST from disk ground truth
-# ─────────────────────────────────────────────────────────────
+# ── PHASE 5: REBUILD MANIFEST ─────────────────────────────────────────────
 
 def phase_rebuild(manifest: dict) -> dict:
     log.info("\n" + "═"*60)
-    log.info("PHASE 4 — REBUILD MANIFEST from disk")
+    log.info("PHASE 5 — REBUILD MANIFEST from HuggingFace")
     log.info("═"*60)
+
+    hf_files = hf_list_pdfs()
+    log.info(f"  HF files found: {len(hf_files)}")
 
     old_count = len(manifest.get("downloaded", []))
 
-    # Build index of existing manifest entries
+    # Build index of existing manifest entries by (date, filename)
     existing = {}
     for e in manifest.get("downloaded", []):
         key = (e["date"], e["filename"].lower())
         existing[key] = e
 
-    rebuilt = []
-    dates_done = set()
-    dates_no_pdfs = set()
+    rebuilt     = []
+    dates_done  = set()
+    dates_empty = set(manifest.get("dates_no_pdfs", []))
 
-    # Walk all date folders on disk
-    d = START_DATE
-    while d <= END_DATE:
-        ds = d.isoformat()
-        date_dir = PDF_DIR / ds
-        if date_dir.exists():
-            pdfs = list(date_dir.glob("*.pdf")) + list(date_dir.glob("*.PDF"))
-            if pdfs:
-                dates_done.add(ds)
-                for pdf in pdfs:
-                    key = (ds, pdf.name.lower())
-                    if key in existing:
-                        # Keep existing metadata, update path
-                        e = dict(existing[key])
-                        e["local_path"] = str(Path("pdfs") / ds / pdf.name)
-                        e["file_size_kb"] = round(pdf.stat().st_size/1024, 1)
-                        rebuilt.append(e)
-                    else:
-                        # New file on disk — generate metadata
-                        combined = pdf.name
-                        rebuilt.append({
-                            "date":         ds,
-                            "date_display": d.strftime("%d/%m/%Y"),
-                            "filename":     pdf.name,
-                            "title":        pdf.name,
-                            "url":          "",
-                            "pr_number":    extract_pr(combined),
-                            "language":     detect_lang(combined),
-                            "department":   extract_dept(combined),
-                            "local_path":   str(Path("pdfs") / ds / pdf.name),
-                            "download_status": "exists",
-                            "file_size_kb": round(pdf.stat().st_size/1024, 1),
-                        })
-            else:
-                # Folder exists but empty
-                dates_done.add(ds)
-                dates_no_pdfs.add(ds)
-        d += timedelta(days=1)
+    for hf_path in sorted(hf_files):
+        # hf_path format: pdfs/2026-05-10/DIPR-...pdf
+        parts = hf_path.split("/")
+        if len(parts) != 3:
+            continue
+        _, ds, fname = parts
 
-    # Deduplicate by (date, filename)
-    seen = set()
-    deduped = []
+        key = (ds, fname.lower())
+        if key in existing:
+            e = dict(existing[key])
+            e["local_path"] = hf_path
+            e["hf_path"]    = hf_path
+            rebuilt.append(e)
+        else:
+            rebuilt.append({
+                "date":            ds,
+                "date_display":    datetime.strptime(ds,"%Y-%m-%d").strftime("%d/%m/%Y"),
+                "filename":        fname,
+                "title":           fname,
+                "url":             "",
+                "pr_number":       extract_pr(fname),
+                "language":        detect_lang(fname),
+                "department":      extract_dept(fname),
+                "local_path":      hf_path,
+                "hf_path":         hf_path,
+                "download_status": "on_hf",
+                "file_size_kb":    0,
+            })
+        dates_done.add(ds)
+
+    # Fix PR-??? one final pass
     for e in rebuilt:
-        k = (e["date"], e["filename"].lower())
-        if k not in seen:
-            seen.add(k)
-            deduped.append(e)
-
-    # Sort by date then filename
-    deduped.sort(key=lambda e: (e["date"], e["filename"]))
-
-    manifest["downloaded"]    = deduped
-    manifest["dates_done"]    = sorted(dates_done)
-    manifest["dates_no_pdfs"] = sorted(dates_no_pdfs)
-    manifest["failed"]        = []
-
-    # Fix PR numbers one more pass
-    for e in manifest["downloaded"]:
         if e.get("pr_number") == "PR-???":
             fixed = extract_pr(e.get("title","") + " " + e.get("filename",""))
             if fixed != "PR-???":
                 e["pr_number"] = fixed
 
+    # Deduplicate
+    seen, deduped = set(), []
+    for e in rebuilt:
+        k = (e["date"], e["filename"].lower())
+        if k not in seen:
+            seen.add(k)
+            deduped.append(e)
+    deduped.sort(key=lambda e: (e["date"], e["filename"]))
+
+    # Merge back existing dates_done (including empty dates)
+    for ds in manifest.get("dates_done", []):
+        dates_done.add(ds)
+
+    manifest["downloaded"]    = deduped
+    manifest["dates_done"]    = sorted(dates_done)
+    manifest["dates_no_pdfs"] = sorted(dates_empty)
+    manifest["failed"]        = []
+
     save_manifest(manifest)
+    hf_upload_manifest()
+
     log.info(f"  Rebuilt: {old_count} → {len(deduped)} entries")
-    log.info(f"  Dates done: {len(dates_done)}  |  Empty dates: {len(dates_no_pdfs)}")
     return manifest
 
-# ─────────────────────────────────────────────────────────────
-# PHASE 5 — FINAL VALIDATION (no website scrape, disk + manifest only)
-# ─────────────────────────────────────────────────────────────
+# ── PHASE 6: FINAL CHECK + REPORT ─────────────────────────────────────────
 
-def phase_final_check(manifest: dict) -> dict:
+def phase_final(manifest: dict, issues_found: list, run_start: datetime) -> dict:
     log.info("\n" + "═"*60)
-    log.info("PHASE 5 — FINAL VALIDATION")
+    log.info("PHASE 6 — FINAL CHECK + REPORT")
     log.info("═"*60)
 
     downloaded    = manifest.get("downloaded", [])
@@ -840,63 +712,18 @@ def phase_final_check(manifest: dict) -> dict:
         all_dates.append(d)
         d += timedelta(days=1)
 
-    per_date = defaultdict(list)
-    for e in downloaded:
-        per_date[e["date"]].append(e)
-
     checks = {
-        "missing_dates":     [],
-        "unexpected_empty":  [],
-        "manifest_no_file":  [],
-        "orphan_files":      [],
-        "corrupt_pdfs":      [],
-        "bad_pr_numbers":    [],
-        "duplicate_entries": [],
-        "path_mismatch":     [],
+        "missing_dates":    [],
+        "bad_pr_numbers":   [],
+        "duplicate_entries":[],
     }
-
-    manifest_fnames = {e["filename"].lower() for e in downloaded}
-
-    # Date checks
-    for d in all_dates:
-        ds = d.isoformat()
-        if ds not in dates_done:
+    for dd in all_dates:
+        ds = dd.isoformat()
+        if ds not in dates_done and dd < date.today():
             checks["missing_dates"].append(ds)
-        elif len(per_date.get(ds, [])) == 0 and ds not in dates_no_pdfs:
-            checks["unexpected_empty"].append(ds)
-
-    # File checks
     for e in downloaded:
-        p = PDF_DIR / e["date"] / e["filename"]
-        if not p.exists():
-            checks["manifest_no_file"].append(e)
-        else:
-            sz = p.stat().st_size
-            if sz < 1000:
-                checks["corrupt_pdfs"].append({**e, "issue": f"size={sz}"})
-            else:
-                try:
-                    with open(p,"rb") as f:
-                        if f.read(4) != b"%PDF":
-                            checks["corrupt_pdfs"].append({**e,"issue":"bad magic"})
-                except Exception:
-                    pass
         if e.get("pr_number") == "PR-???":
-            checks["bad_pr_numbers"].append(e)
-        lp = e.get("local_path","").replace("\\","/")
-        if lp and e["date"] not in lp:
-            checks["path_mismatch"].append(e)
-
-    # Orphans
-    for date_dir in PDF_DIR.iterdir():
-        if not date_dir.is_dir(): continue
-        if not re.match(r"\d{4}-\d{2}-\d{2}", date_dir.name): continue
-        for pdf in date_dir.iterdir():
-            if pdf.suffix.lower() == ".pdf":
-                if pdf.name.lower() not in manifest_fnames:
-                    checks["orphan_files"].append(str(pdf))
-
-    # Duplicates
+            checks["bad_pr_numbers"].append(e["filename"])
     seen = {}
     for e in downloaded:
         k = (e["date"], e["filename"].lower())
@@ -904,162 +731,131 @@ def phase_final_check(manifest: dict) -> dict:
             checks["duplicate_entries"].append(e["filename"])
         seen[k] = True
 
-    # Print results
-    total_issues = 0
-    for check, items in checks.items():
-        icon = "✅" if not items else "❌"
-        log.info(f"  {icon} {check:<25}: {len(items)}")
-        total_issues += len(items)
+    total_issues = sum(len(v) for v in checks.values())
 
-    # Summary
-    total_pdfs = len(downloaded)
-    total_size = sum(f.stat().st_size for f in PDF_DIR.rglob("*.pdf") if f.is_file())
+    for k, v in checks.items():
+        icon = "✅" if not v else "❌"
+        log.info(f"  {icon} {k:<25}: {len(v)}")
 
-    log.info(f"\n  📄 Total PDFs in manifest : {total_pdfs}")
-    log.info(f"  💾 Total size on disk     : {total_size/(1024*1024):.1f} MB")
-    log.info(f"  📅 Dates processed        : {len(dates_done)}/{len(all_dates)}")
-    log.info(f"  🔍 Total issues           : {total_issues}")
+    log.info(f"\n  📄 Manifest entries : {len(downloaded)}")
+    log.info(f"  📅 Dates done       : {len(dates_done)}/{len(all_dates)}")
+    log.info(f"  🔍 Remaining issues : {total_issues}")
+
+    # Update run_history (last 10 only)
+    history = manifest.get("run_history", [])
+    history.append({
+        "run_at":          run_start.isoformat(timespec="seconds"),
+        "new_pdfs":        manifest.get("_new_pdfs_this_run", 0),
+        "hf_uploaded":     manifest.get("_hf_uploaded", 0),
+        "issues_found":    len(issues_found),
+        "issues_fixed":    len([i for i in issues_found if i["type"] != "MISSING_DATE"]),
+        "status":          "ok" if total_issues == 0 else "warn",
+    })
+    manifest["run_history"] = history[-10:]
+
+    # Clean internal keys
+    for k in ["_new_pdfs_this_run","_hf_uploaded","_hf_deleted","_hf_failed"]:
+        manifest.pop(k, None)
+
+    save_manifest(manifest)
+    hf_upload_manifest()
+
+    # Save report
+    ts  = run_start.strftime("%Y%m%d_%H%M%S")
+    rpt = REPORT_DIR / f"audit_{ts}.txt"
+    lines = [
+        f"DIPR TN — Audit Report  {run_start.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"{'='*60}",
+        f"Total PDFs   : {len(downloaded)}",
+        f"Dates done   : {len(dates_done)}/{len(all_dates)}",
+        f"Issues found : {len(issues_found)}",
+        f"Final issues : {total_issues}",
+        "",
+        "Final checks:",
+    ]
+    for k,v in checks.items():
+        lines.append(f"  {'✅' if not v else '❌'} {k}: {len(v)}")
+    lines += ["", "Run history (last 10):"]
+    for r in manifest["run_history"][-10:]:
+        lines.append(f"  {r['run_at']}  new_pdfs={r['new_pdfs']}  status={r['status']}")
+    rpt.write_text("\n".join(lines), encoding="utf-8")
+    log.info(f"\n  Report saved: {rpt.name}")
 
     manifest["final_check"] = {
-        "timestamp": datetime.now().isoformat(timespec="seconds"),
-        "total_pdfs": total_pdfs,
-        "total_size_mb": round(total_size/(1024*1024), 2),
+        "timestamp":    run_start.isoformat(timespec="seconds"),
         "total_issues": total_issues,
-        "checks": {k: len(v) for k,v in checks.items()},
+        "checks":       {k: len(v) for k,v in checks.items()},
     }
     save_manifest(manifest)
     return manifest
 
-# ─────────────────────────────────────────────────────────────
-# PHASE 6 — REPORT
-# ─────────────────────────────────────────────────────────────
-
-def phase_report(manifest: dict, issues: list):
-    log.info("\n" + "═"*60)
-    log.info("PHASE 6 — AUDIT REPORT")
-    log.info("═"*60)
-
-    ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
-    rpt  = REPORT_DIR / f"audit_{ts}.txt"
-
-    lines = []
-    def w(s=""): lines.append(s)
-
-    w("╔══════════════════════════════════════════════════════════════╗")
-    w("║          DIPR TN — Agentic Pipeline Audit Report            ║")
-    w(f"║  Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}                        ║")
-    w("╚══════════════════════════════════════════════════════════════╝")
-    w()
-
-    fc = manifest.get("final_check", {})
-    w(f"  Total PDFs      : {fc.get('total_pdfs','?')}")
-    w(f"  Total size      : {fc.get('total_size_mb','?')} MB")
-    w(f"  Total issues    : {fc.get('total_issues','?')}")
-    w()
-
-    w("── Issues found & fixed ──")
-    by_type = defaultdict(list)
-    for iss in issues:
-        by_type[iss["type"]].append(iss)
-    for t, items in sorted(by_type.items()):
-        w(f"  {t:<30}: {len(items)}")
-    w()
-
-    w("── Final check results ──")
-    for k, v in fc.get("checks", {}).items():
-        icon = "✅" if v == 0 else "❌"
-        w(f"  {icon} {k:<30}: {v}")
-    w()
-
-    w("── Per-date PDF counts ──")
-    per_date = defaultdict(int)
-    for e in manifest.get("downloaded", []):
-        per_date[e["date"]] += 1
-    dates_no = set(manifest.get("dates_no_pdfs", []))
-    d = START_DATE
-    while d <= END_DATE:
-        ds = d.isoformat()
-        cnt = per_date.get(ds, 0)
-        note = " (no PDFs published)" if ds in dates_no else ""
-        w(f"  {ds}  {d.strftime('%A'):10s}  {cnt:>3} PDFs{note}")
-        d += timedelta(days=1)
-
-    rpt.write_text("\n".join(lines), encoding="utf-8")
-    log.info(f"  📄 Report saved: {rpt}")
-    return rpt
-
-# ─────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────
+# ── MAIN ──────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--validate-only", action="store_true",
-                        help="Skip download phase, validate + fix existing")
-    parser.add_argument("--report-only",   action="store_true",
-                        help="Just show report from last run")
+                        help="Skip download, just validate + fix + upload")
     args = parser.parse_args()
 
-    manifest = load_manifest()
-
-    if args.report_only:
-        phase_final_check(manifest)
-        phase_report(manifest, [])
-        return
+    run_start = datetime.now()
+    manifest  = load_manifest()
 
     log.info("╔══════════════════════════════════════════════════════════╗")
-    log.info("║    DIPR TN — Agentic Download + Validate + Auto-Fix     ║")
-    log.info(f"║    {START_DATE}  →  {END_DATE}                              ║")
+    log.info("║   DIPR TN — Agentic Pipeline (HuggingFace storage)      ║")
+    log.info(f"║   {START_DATE}  →  {END_DATE}                               ║")
     log.info("╚══════════════════════════════════════════════════════════╝\n")
 
-    log.info("🌐 Starting Chrome browser...")
-    try:
-        driver = make_driver()
-        driver.get(BASE_URL)
-        time.sleep(3)
-        log.info("✅ Browser ready\n")
-    except Exception as e:
-        log.error(f"❌ Could not start Chrome: {e}")
-        sys.exit(1)
-
     issues = []
-    try:
-        # Phase 1: Download all dates
-        if not args.validate_only:
+
+    if not args.validate_only:
+        # Phase 1: Download
+        log.info("🌐 Starting Chrome...")
+        try:
+            driver = make_driver()
+            driver.get(BASE_URL)
+            time.sleep(3)
+            log.info("✅ Browser ready\n")
+        except Exception as e:
+            log.error(f"❌ Chrome failed: {e}")
+            sys.exit(1)
+
+        try:
             manifest = phase_download(driver, manifest)
+        except KeyboardInterrupt:
+            log.info("Interrupted — saving progress")
+        finally:
+            driver.quit()
+            log.info("🌐 Browser closed")
 
-        # Phase 2: Validate website vs disk vs manifest
-        manifest, issues = phase_validate(driver, manifest)
+    # Phase 2: Upload to HuggingFace + delete local PDFs
+    manifest = phase_upload_to_hf(manifest)
 
-    except KeyboardInterrupt:
-        log.info("\n⚠️  Interrupted — progress saved")
-    finally:
-        driver.quit()
-        log.info("🌐 Browser closed")
+    # Phase 3: Validate
+    manifest, issues = phase_validate(manifest)
 
-    # Phase 3: Auto-fix all issues (no browser needed)
+    # Phase 4: Auto-fix
     if issues:
-        manifest = phase_autofix(None, manifest, issues)
+        manifest = phase_autofix(manifest, issues)
 
-    # Phase 4: Rebuild manifest from disk ground truth
+    # Phase 5: Rebuild manifest from HF
     manifest = phase_rebuild(manifest)
 
-    # Phase 5: Final validation
-    manifest = phase_final_check(manifest)
+    # Phase 6: Final check + report
+    manifest = phase_final(manifest, issues, run_start)
 
-    # Phase 6: Report
-    rpt = phase_report(manifest, issues)
-
-    # Final banner
+    # Summary banner
     fc = manifest.get("final_check", {})
-    total_issues = fc.get("total_issues", "?")
+    n  = fc.get("total_issues", "?")
     log.info("\n╔══════════════════════════════════════════════════════════╗")
-    if total_issues == 0:
-        log.info("║  🎉  PERFECT — 0 issues. All PDFs valid and complete!   ║")
+    if n == 0:
+        log.info("║  ✅  PERFECT — 0 issues. All PDFs on HuggingFace.       ║")
     else:
-        log.info(f"║  ⚠️   {total_issues} issue(s) remain — check report for details     ║")
-    log.info(f"║  📄  {fc.get('total_pdfs','?')} PDFs  |  {fc.get('total_size_mb','?')} MB  |  Report: {rpt.name}  ║")
+        log.info(f"║  ⚠️   {n} issue(s) remain — check report                 ║")
+    log.info(f"║  📄  {len(manifest.get('downloaded',[]))} PDFs  |  HF: {HF_REPO_ID or 'not set'}  ║")
     log.info("╚══════════════════════════════════════════════════════════╝")
+
+    # Exit 0 even if warnings (so cron doesn't fail on empty-day runs)
+    sys.exit(0)
 
 
 if __name__ == "__main__":

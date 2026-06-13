@@ -1,47 +1,45 @@
-# DIPR TN — Agentic Pipeline
+# DIPR TN PDF Downloader
 
-Single script that downloads, validates, and auto-fixes everything.
+Downloads all press release PDFs from dipr.tn.gov.in
+**Date range: 10 May 2026 → today**
 
 ## Setup
+
 ```bash
 pip install -r requirements.txt
 ```
 
+Chrome browser must be installed on your computer.
+
 ## Run
 
-### Full run (download + validate + fix)
 ```bash
-python agent.py
+python download_pdfs.py
 ```
 
-### Validate + fix only (skip download, use existing PDFs)
-```bash
-python agent.py --validate-only
+## What happens
+
+1. Opens Chrome (headless — no window)
+2. Loads dipr.tn.gov.in/press-release1.html
+3. For each date (Mon–Sat), sets the date and waits for PDF links to load
+4. Downloads every PDF into `pdfs/YYYY-MM-DD/filename.pdf`
+5. Saves progress to `pdfs/manifest.json` after every date
+
+## Re-run safely
+
+If it stops midway, just run again.
+Already-downloaded dates and files are skipped automatically.
+
+## Output structure
+
 ```
-
-### Report only
-```bash
-python agent.py --report-only
+pdfs/
+├── manifest.json          ← tracks everything
+├── download.log           ← full log
+├── 2026-05-10/
+│   ├── DIPR-P.R.No.001-....pdf
+│   └── DIPR-P.R.No.002-....pdf
+├── 2026-05-11/
+│   └── ...
+└── ...
 ```
-
-## What it does automatically
-
-| Phase | Action |
-|-------|--------|
-| 1. Download  | Scrapes website date-by-date, downloads all PDFs |
-| 2. Validate  | Compares website vs disk vs manifest per date |
-| 3. Auto-Fix  | Resolves every issue found |
-| 4. Rebuild   | Rebuilds manifest from disk ground truth |
-| 5. Final Check | Runs all 8 validation checks |
-| 6. Report    | Saves full audit to reports/audit_TIMESTAMP.txt |
-
-## Issues auto-fixed
-
-- Missing PDFs → re-downloaded from website
-- Wrong-date files in folder → moved or deleted
-- Manifest entry, no file → re-downloaded
-- File on disk, not in manifest → added to manifest
-- Corrupt PDF → re-downloaded
-- PR-??? → re-extracted with full regex
-- Duplicate manifest entries → deduplicated
-- Path date mismatch → corrected in manifest
