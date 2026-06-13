@@ -29,24 +29,16 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      # ── NO browser-actions/setup-chrome — runner already has Chrome ──
-      # browser-actions/setup-chrome was CAUSING the problem:
-      # it installs a new Chrome binary but leaves the OLD chromedriver
-      # → version mismatch → renderer timeout
-
       - name: Install Python dependencies
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Verify Chrome + ChromeDriver match
+      - name: Verify Chrome works with APEX-level JS
         run: |
-          echo "Chrome version:"
-          google-chrome --version
-          echo ""
-          echo "ChromeDriver version:"
-          chromedriver --version || echo "chromedriver not in PATH — webdriver-manager will handle"
-          echo ""
+          echo "Chrome: $(google-chrome --version)"
+          echo "ChromeDriver: $(chromedriver --version 2>/dev/null || echo 'via webdriver-manager')"
+          echo "/dev/shm size: $(df -h /dev/shm | tail -1)"
           python -c "
           from selenium import webdriver
           from selenium.webdriver.chrome.options import Options
@@ -58,14 +50,23 @@ jobs:
           opts.add_argument('--no-sandbox')
           opts.add_argument('--disable-dev-shm-usage')
           opts.add_argument('--disable-gpu')
+          opts.add_argument('--shm-size=2gb')
+          opts.add_argument('--memory-pressure-off')
+          opts.add_argument('--disable-renderer-backgrounding')
+          opts.binary_location = '/usr/bin/google-chrome'
 
-          print('Installing matching chromedriver...')
           svc    = Service(ChromeDriverManager().install())
           driver = webdriver.Chrome(service=svc, options=opts)
-          driver.get('https://example.com')
-          print(f'Chrome OK — title: {driver.title}')
+          driver.set_page_load_timeout(60)
+
+          # Test with the actual DIPR site
+          print('Loading DIPR website...')
+          driver.get('https://dipr.tn.gov.in/press-release1.html')
+          import time; time.sleep(5)
+          print(f'DIPR loaded — title: {driver.title}')
+          print(f'URL: {driver.current_url}')
           driver.quit()
-          print('Chrome verified successfully')
+          print('Chrome verified on DIPR site')
           "
 
       - name: Run DIPR agent

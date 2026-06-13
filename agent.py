@@ -180,14 +180,13 @@ def hf_upload_manifest():
 
 def make_driver():
     """
-    GitHub Actions compatible Chrome setup.
+    GitHub Actions compatible Chrome setup for heavy JS pages (Oracle APEX).
 
-    Root cause of timeout: version mismatch between Chrome binary and chromedriver.
-    - system /usr/bin/chromedriver may not match /usr/bin/google-chrome
-    - setup-chrome chromium binary may not match system chromedriver
+    Root cause of 'Timed out receiving message from renderer':
+    GitHub Actions runners have very limited /dev/shm (64MB default).
+    Oracle APEX is extremely JS-heavy and exhausts shared memory.
 
-    Fix: always use /usr/bin/google-chrome (full stable) + webdriver-manager
-    which downloads the chromedriver that exactly matches Chrome version.
+    Fix: use --shm-size workaround flags + increase renderer timeout.
     """
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
@@ -195,28 +194,46 @@ def make_driver():
     from webdriver_manager.chrome import ChromeDriverManager
 
     opts = Options()
+    # ── Core headless flags ───────────────────────────────────────────
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-dev-shm-usage")   # use /tmp instead of /dev/shm
     opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1920,1080")
+
+    # ── Memory flags — critical for APEX on GitHub Actions ────────────
+    # APEX loads dozens of JS files; default shm limit kills the renderer
+    opts.add_argument("--shm-size=2gb")             # increase shared memory
+    opts.add_argument("--memory-pressure-off")
+    opts.add_argument("--disable-renderer-backgrounding")
+    opts.add_argument("--renderer-process-limit=1") # single renderer to save RAM
+
+    # ── Stability flags ───────────────────────────────────────────────
     opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_argument("--disable-extensions")
     opts.add_argument("--disable-software-rasterizer")
+    opts.add_argument("--disable-background-networking")
+    opts.add_argument("--disable-default-apps")
+    opts.add_argument("--disable-sync")
+    opts.add_argument("--no-first-run")
+    opts.add_argument("--disable-client-side-phishing-detection")
+    opts.add_argument("--disable-hang-monitor")
+    opts.add_argument("--disable-prompt-on-repost")
+    opts.add_argument("--disable-translate")
+    opts.add_argument("--metrics-recording-only")
+    opts.add_argument("--safebrowsing-disable-auto-update")
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_argument(
         "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36"
     )
 
-    # Use system google-chrome (full stable build)
-    # webdriver-manager downloads the MATCHING chromedriver automatically
     opts.binary_location = "/usr/bin/google-chrome"
     log.info("  Chrome: /usr/bin/google-chrome + webdriver-manager chromedriver")
 
     svc    = Service(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=svc, options=opts)
-    driver.set_page_load_timeout(30)
+    driver.set_page_load_timeout(60)   # APEX needs more time to load
     driver.implicitly_wait(5)
     return driver
 
