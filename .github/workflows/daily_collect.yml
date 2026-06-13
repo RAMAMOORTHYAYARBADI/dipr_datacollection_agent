@@ -29,28 +29,44 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Install Chrome
-        uses: browser-actions/setup-chrome@v1
-        with:
-          chrome-version: stable
+      # ── NO browser-actions/setup-chrome — runner already has Chrome ──
+      # browser-actions/setup-chrome was CAUSING the problem:
+      # it installs a new Chrome binary but leaves the OLD chromedriver
+      # → version mismatch → renderer timeout
 
       - name: Install Python dependencies
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ── Print exact Chrome binary path so agent.py can find it ──────
-      - name: Find Chrome binary path
+      - name: Verify Chrome + ChromeDriver match
         run: |
-          echo "=== Chrome binary locations ==="
-          which google-chrome 2>/dev/null && google-chrome --version || echo "google-chrome not in PATH"
-          which chromium 2>/dev/null && chromium --version || echo "chromium not in PATH"
-          find /opt/hostedtoolcache -name "chrome" -o -name "chromium" 2>/dev/null | head -10
-          find /usr -name "google-chrome*" 2>/dev/null | head -5
+          echo "Chrome version:"
+          google-chrome --version
           echo ""
-          echo "=== ChromeDriver locations ==="
-          find /opt/hostedtoolcache -name "chromedriver" 2>/dev/null | head -5
-          which chromedriver 2>/dev/null || echo "chromedriver not in PATH"
+          echo "ChromeDriver version:"
+          chromedriver --version || echo "chromedriver not in PATH — webdriver-manager will handle"
+          echo ""
+          python -c "
+          from selenium import webdriver
+          from selenium.webdriver.chrome.options import Options
+          from selenium.webdriver.chrome.service import Service
+          from webdriver_manager.chrome import ChromeDriverManager
+
+          opts = Options()
+          opts.add_argument('--headless=new')
+          opts.add_argument('--no-sandbox')
+          opts.add_argument('--disable-dev-shm-usage')
+          opts.add_argument('--disable-gpu')
+
+          print('Installing matching chromedriver...')
+          svc    = Service(ChromeDriverManager().install())
+          driver = webdriver.Chrome(service=svc, options=opts)
+          driver.get('https://example.com')
+          print(f'Chrome OK — title: {driver.title}')
+          driver.quit()
+          print('Chrome verified successfully')
+          "
 
       - name: Run DIPR agent
         env:
@@ -59,6 +75,7 @@ jobs:
           HF_REPO_ID:   ${{ secrets.HF_REPO_ID }}
         run: |
           MODE="${{ github.event.inputs.mode || 'full' }}"
+          echo "Mode: $MODE"
           if [ "$MODE" = "validate-only" ]; then
             python agent.py --validate-only
           else

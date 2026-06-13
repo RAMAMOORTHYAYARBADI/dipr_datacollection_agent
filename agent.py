@@ -182,16 +182,17 @@ def make_driver():
     """
     GitHub Actions compatible Chrome setup.
 
-    Problem: webdriver-manager downloads chromedriver but Chrome binary
-    path on GitHub Actions runners is non-standard, causing timeout.
+    Root cause of timeout: version mismatch between Chrome binary and chromedriver.
+    - system /usr/bin/chromedriver may not match /usr/bin/google-chrome
+    - setup-chrome chromium binary may not match system chromedriver
 
-    Fix: explicitly find the Chrome binary installed by
-    browser-actions/setup-chrome and pass it to ChromeOptions.
+    Fix: always use /usr/bin/google-chrome (full stable) + webdriver-manager
+    which downloads the chromedriver that exactly matches Chrome version.
     """
-    import subprocess
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
     from selenium.webdriver.chrome.service import Service
+    from webdriver_manager.chrome import ChromeDriverManager
 
     opts = Options()
     opts.add_argument("--headless=new")
@@ -201,78 +202,19 @@ def make_driver():
     opts.add_argument("--window-size=1920,1080")
     opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_argument("--disable-extensions")
-    opts.add_argument("--remote-debugging-port=0")  # avoids port conflict
+    opts.add_argument("--disable-software-rasterizer")
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_argument(
         "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36"
     )
 
-    # ── Find Chrome binary ─────────────────────────────────────────────
-    # browser-actions/setup-chrome installs to known paths on GitHub runners
-    chrome_candidates = [
-        # browser-actions/setup-chrome path (GitHub Actions)
-        "/opt/hostedtoolcache/setup-chrome/google-chrome/stable/x64/chrome",
-        "/opt/hostedtoolcache/setup-chrome/chromium/stable/x64/chrome",
-        # Standard Linux paths
-        "/usr/bin/google-chrome",
-        "/usr/bin/google-chrome-stable",
-        "/usr/bin/chromium",
-        "/usr/bin/chromium-browser",
-        # snap
-        "/snap/bin/chromium",
-    ]
+    # Use system google-chrome (full stable build)
+    # webdriver-manager downloads the MATCHING chromedriver automatically
+    opts.binary_location = "/usr/bin/google-chrome"
+    log.info("  Chrome: /usr/bin/google-chrome + webdriver-manager chromedriver")
 
-    chrome_binary = None
-    for path in chrome_candidates:
-        if Path(path).exists():
-            chrome_binary = path
-            log.info(f"  Found Chrome binary: {path}")
-            break
-
-    if not chrome_binary:
-        # Last resort: ask the OS
-        try:
-            result = subprocess.run(
-                ["which", "google-chrome"],
-                capture_output=True, text=True, timeout=5
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                chrome_binary = result.stdout.strip()
-                log.info(f"  Found Chrome via which: {chrome_binary}")
-        except Exception:
-            pass
-
-    if chrome_binary:
-        opts.binary_location = chrome_binary
-    else:
-        log.warning("  Chrome binary not found via path scan — using system default")
-
-    # ── Find ChromeDriver ──────────────────────────────────────────────
-    # Try to find chromedriver that matches the installed Chrome
-    chromedriver_candidates = [
-        # browser-actions/setup-chrome also installs chromedriver
-        "/opt/hostedtoolcache/setup-chrome/google-chrome/stable/x64/chromedriver",
-        "/opt/hostedtoolcache/setup-chrome/chromium/stable/x64/chromedriver",
-        "/usr/bin/chromedriver",
-        "/usr/local/bin/chromedriver",
-    ]
-
-    chromedriver_path = None
-    for path in chromedriver_candidates:
-        if Path(path).exists():
-            chromedriver_path = path
-            log.info(f"  Found chromedriver: {path}")
-            break
-
-    if chromedriver_path:
-        svc = Service(chromedriver_path)
-    else:
-        # Fall back to webdriver-manager
-        log.info("  Using webdriver-manager for chromedriver")
-        from webdriver_manager.chrome import ChromeDriverManager
-        svc = Service(ChromeDriverManager().install())
-
+    svc    = Service(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=svc, options=opts)
     driver.set_page_load_timeout(30)
     driver.implicitly_wait(5)
