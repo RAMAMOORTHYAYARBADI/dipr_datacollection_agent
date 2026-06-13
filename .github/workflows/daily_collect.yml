@@ -2,8 +2,7 @@ name: Daily DIPR Press Release Collection
 
 on:
   schedule:
-    - cron: "30 12 * * *"   # 6:00 PM IST = 12:30 PM UTC
-
+    - cron: "30 12 * * *"
   workflow_dispatch:
     inputs:
       mode:
@@ -15,46 +14,44 @@ on:
           - full
           - validate-only
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true   # suppress Node 20 deprecation warning
-
 jobs:
   collect:
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
     steps:
-      # ── 1. Checkout ───────────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── 2. Python ─────────────────────────────────────────────────────
       - name: Setup Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
 
-      # ── 3. Chrome ─────────────────────────────────────────────────────
       - name: Install Chrome
         uses: browser-actions/setup-chrome@v1
         with:
           chrome-version: stable
 
-      # ── 4. Show Chrome version (debug) ────────────────────────────────
-      - name: Verify Chrome
-        run: |
-          google-chrome --version || chromium --version || chromium-browser --version
-          which chromedriver || echo "chromedriver not in PATH yet"
-
-      # ── 5. Dependencies ───────────────────────────────────────────────
       - name: Install Python dependencies
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
-          python -c "import selenium, bs4, requests, huggingface_hub; print('All imports OK')"
 
-      # ── 6. Run agent (with detailed error output) ─────────────────────
+      # ── Print exact Chrome binary path so agent.py can find it ──────
+      - name: Find Chrome binary path
+        run: |
+          echo "=== Chrome binary locations ==="
+          which google-chrome 2>/dev/null && google-chrome --version || echo "google-chrome not in PATH"
+          which chromium 2>/dev/null && chromium --version || echo "chromium not in PATH"
+          find /opt/hostedtoolcache -name "chrome" -o -name "chromium" 2>/dev/null | head -10
+          find /usr -name "google-chrome*" 2>/dev/null | head -5
+          echo ""
+          echo "=== ChromeDriver locations ==="
+          find /opt/hostedtoolcache -name "chromedriver" 2>/dev/null | head -5
+          which chromedriver 2>/dev/null || echo "chromedriver not in PATH"
+
       - name: Run DIPR agent
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
@@ -62,32 +59,28 @@ jobs:
           HF_REPO_ID:   ${{ secrets.HF_REPO_ID }}
         run: |
           MODE="${{ github.event.inputs.mode || 'full' }}"
-          echo "Running in mode: $MODE"
-          echo "HF_REPO_ID: $HF_REPO_ID"
-          echo "HF_TOKEN set: ${{ secrets.HF_TOKEN != '' }}"
-
           if [ "$MODE" = "validate-only" ]; then
             python agent.py --validate-only
           else
             python agent.py
           fi
 
-      # ── 7. Commit manifest + reports ──────────────────────────────────
-      - name: Commit updated files
+      - name: Commit manifest and reports
+        if: always()
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add pdfs/manifest.json reports/ || true
-          git diff --staged --quiet || git commit -m "chore: daily update $(date -u '+%Y-%m-%d')"
-          git push
+          git add pdfs/manifest.json reports/ agent.log || true
+          git diff --staged --quiet || git commit -m "chore: update $(date -u '+%Y-%m-%d')"
+          git push || true
 
-      # ── 8. Upload report artifact (even on failure) ───────────────────
-      - name: Upload audit report
+      - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: audit-report-${{ github.run_number }}
+          name: logs-${{ github.run_number }}
           path: |
-            reports/audit_*.txt
             agent.log
+            reports/audit_*.txt
           retention-days: 30
+          if-no-files-found: warn
